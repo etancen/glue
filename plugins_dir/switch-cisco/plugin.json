@@ -1,0 +1,13 @@
+{
+  "name": "switch-cisco",
+  "version": "1.0.0",
+  "display_name": "Cisco Switch Configurator",
+  "description": "Configure Cisco switches via SSH/Telnet",
+  "node_types": ["switch"],
+  "connectors": ["ssh", "telnet"],
+  "default_config": {
+    "ssh_port": 22,
+    "timeout": 60
+  },
+  "required_config": ["management_ip", "admin_creds"]
+}
