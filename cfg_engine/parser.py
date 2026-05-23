@@ -1,11 +1,15 @@
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_schema(cfg: dict) -> list[str]:
     """Basic structural validation. Returns list of error messages."""
     errors = []
     if not isinstance(cfg, dict):
+        logger.error("CFG validation failed: root is not a dict (type=%s)", type(cfg).__name__)
         return ["CFG root must be a JSON object"]
 
     if "plan_name" not in cfg or not isinstance(cfg["plan_name"], str):
@@ -13,7 +17,15 @@ def _validate_schema(cfg: dict) -> list[str]:
 
     if "nodes" not in cfg or not isinstance(cfg["nodes"], list) or len(cfg["nodes"]) == 0:
         errors.append("Missing or empty 'nodes' array")
+        logger.error("CFG validation failed: %s", errors)
         return errors
+
+    logger.info(
+        "Validating CFG: plan_name=%s nodes_count=%d has_global_config=%s",
+        cfg.get("plan_name"),
+        len(cfg["nodes"]),
+        "global_config" in cfg,
+    )
 
     node_ids = set()
     for i, node in enumerate(cfg["nodes"]):
@@ -37,15 +49,25 @@ def _validate_schema(cfg: dict) -> list[str]:
             if dep not in node_ids:
                 errors.append(f"Node '{node_id}': depends on unknown node '{dep}'")
 
+    if errors:
+        logger.warning("CFG validation found %d error(s): %s", len(errors), errors)
+    else:
+        logger.info("CFG validation passed: %d node(s), node_ids=%s", len(cfg["nodes"]), sorted(node_ids))
+
     return errors
 
 
 def parse_and_validate(cfg_json: str | bytes | dict) -> tuple[dict | None, list[str]]:
     """Parse CFG JSON and validate. Returns (parsed_cfg, errors)."""
+    logger.info("parse_and_validate called: input_type=%s", type(cfg_json).__name__)
+
     if isinstance(cfg_json, (str, bytes)):
+        input_len = len(cfg_json) if isinstance(cfg_json, (str, bytes)) else 0
+        logger.debug("Parsing JSON string: length=%d", input_len)
         try:
             cfg = json.loads(cfg_json)
         except json.JSONDecodeError as e:
+            logger.error("Invalid JSON in CFG: %s", e)
             return None, [f"Invalid JSON: {e}"]
     else:
         cfg = cfg_json
@@ -54,6 +76,7 @@ def parse_and_validate(cfg_json: str | bytes | dict) -> tuple[dict | None, list[
     if errors:
         return None, errors
 
+    logger.info("parse_and_validate succeeded: plan=%s nodes=%d", cfg["plan_name"], len(cfg["nodes"]))
     return cfg, []
 
 
@@ -66,4 +89,11 @@ def merge_config(
     merged = dict(plugin_defaults)
     merged.update(global_config)
     merged.update(node_config)
+    logger.info(
+        "Config merged: plugin_defaults_keys=%s global_keys=%s node_keys=%s → merged_keys=%s",
+        sorted(plugin_defaults.keys()),
+        sorted(global_config.keys()),
+        sorted(node_config.keys()),
+        sorted(merged.keys()),
+    )
     return merged

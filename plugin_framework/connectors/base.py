@@ -1,5 +1,8 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class BaseConnector(ABC):
@@ -9,6 +12,24 @@ class BaseConnector(ABC):
         self.target = target
         self.credentials = credentials
         self.extra = kwargs
+        logger.info(
+            "%s initialized: target=%s auth_method=%s extra_keys=%s",
+            type(self).__name__,
+            target,
+            self._auth_summary(),
+            sorted(kwargs.keys()) if kwargs else [],
+        )
+
+    def _auth_summary(self) -> str:
+        if "key_file" in self.credentials:
+            return f"key_file={self.credentials['key_file']}"
+        if "token" in self.credentials:
+            return "token=***"
+        if "api_key" in self.credentials:
+            return "api_key=***"
+        if "username" in self.credentials:
+            return f"username={self.credentials['username']}"
+        return "none"
 
     @abstractmethod
     def connect(self) -> None: ...
