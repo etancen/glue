@@ -49,7 +49,9 @@ class DeploymentNode(models.Model):
     config_params = models.JSONField(default=dict)
 
     class Meta:
-        unique_together = ["plan", "target_id"]
+        constraints = [
+            models.UniqueConstraint(fields=["plan", "target_id"], name="uq_plan_target")
+        ]
 
 
 class Plugin(models.Model):
@@ -75,7 +77,7 @@ class DeploymentJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     plan = models.ForeignKey(DeploymentPlan, on_delete=models.CASCADE, related_name="jobs")
     node = models.OneToOneField(DeploymentNode, on_delete=models.CASCADE, related_name="job")
-    plugin = models.ForeignKey(Plugin, on_delete=models.PROTECT)
+    plugin = models.ForeignKey(Plugin, on_delete=models.PROTECT, related_name="jobs")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     parameters = models.JSONField(default=dict)
     result_log = models.JSONField(default=dict)
