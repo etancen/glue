@@ -1,3 +1,15 @@
+"""计划编排器 — 将部署计划按 6 步流程拆分为可执行的节点级作业。
+
+流程：
+  1. 解析并校验 CFG（parse_and_validate）
+  2. 匹配插件（_match_plugin：显式 plugin > node_type 查找）
+  3. 校验节点配置（merge_config + plugin.validate_config）
+  4. 构建 DAG 拓扑图（build_dag + get_execution_levels）
+  5. 创建 DeploymentNode / DeploymentJob 数据库记录
+  6. 入队所有 Celery 任务到 Redis 队列
+
+编排器是 API 执行端点与 Celery 异步任务的桥梁。任一步骤失败均记录 AuditLog 并终止。
+"""
 import json
 import logging
 from django.utils import timezone as dj_timezone
@@ -13,14 +25,14 @@ logger = logging.getLogger(__name__)
 
 
 def orchestrate_plan(plan_id: str, user_id: str):
-    """Called from the API 'execute' endpoint. Orchestrates the entire plan execution.
+    """编排计划执行的完整 6 步流程 — 将计划从 DRAFT 推进到 QUEUED 状态。
 
-    1. Parse & validate CFG
-    2. Match plugins
-    3. Validate configs
-    4. Build DAG
-    5. Create DeploymentNode and DeploymentJob records
-    6. Enqueue level-0 tasks
+    副作用：修改 Plan 状态、创建 DeploymentNode/DeploymentJob 记录、
+    创建 AuditLog、向 Celery 投递异步任务。
+
+    Args:
+        plan_id: 部署计划 UUID
+        user_id: 触发执行的用户 UUID（记录在 AuditLog 中）
     """
     logger.info("Orchestrate plan start: plan_id=%s user_id=%s", plan_id, user_id)
     plan = DeploymentPlan.objects.get(id=plan_id)
@@ -41,7 +53,7 @@ def orchestrate_plan(plan_id: str, user_id: str):
         return
     logger.info("Step 1/6 OK: CFG valid, plan_name=%s node_count=%d", cfg.get("plan_name", "?"), len(cfg.get("nodes", [])))
 
-    # Reload plugin registry to ensure freshness
+    # 重新扫描插件注册表，确保获取最新插件（如启动后新增的插件目录）
     scan_and_load_plugins()
 
     # Step 2 & 3: Match plugins and validate configs
@@ -58,6 +70,7 @@ def orchestrate_plan(plan_id: str, user_id: str):
             validation_errors.append(err)
             continue
 
+        # 合并三层配置（节点 > 全局 > 插件默认）后校验
         merged = merge_config(
             node_cfg.get("config", {}),
             cfg.get("global_config", {}),
@@ -103,6 +116,7 @@ def orchestrate_plan(plan_id: str, user_id: str):
     logger.info("Step 5/6: Creating DeploymentNode and DeploymentJob records")
     for node_cfg in cfg["nodes"]:
         plugin = _match_plugin(node_cfg)
+        # get_or_create 确保 Plugin 模型与内存 registry 同步
         plugin_model, _ = PluginModel.objects.get_or_create(
             name=plugin.name,
             defaults={
@@ -134,7 +148,7 @@ def orchestrate_plan(plan_id: str, user_id: str):
 
     logger.info("Step 5/6 OK: %d node(s) and %d job(s) created", DeploymentNode.objects.filter(plan=plan).count(), DeploymentJob.objects.filter(plan=plan).count())
 
-    # Step 6: Enqueue tasks for all nodes
+    # Step 6: Enqueue all Celery tasks — 所有任务同一时间入队，DAG 层级由 Celery 并发度自然保证
     logger.info("Step 6/6: Enqueuing Celery tasks for %d node(s)", len(cfg["nodes"]))
     plan.status = DeploymentPlan.Status.QUEUED
     plan.started_at = dj_timezone.now()
@@ -159,7 +173,16 @@ def orchestrate_plan(plan_id: str, user_id: str):
 
 
 def _match_plugin(node_cfg: dict):
-    """Match a plugin to a node config. Explicit 'plugin' field takes priority."""
+    """为节点匹配部署插件 — 显式 plugin 字段优先，其次按 node_type 模糊匹配。
+
+    匹配策略：
+      1. 若节点指定了 plugin：按名称精确查找，未找到返回 None
+      2. 若未指定：按 node_type 在 registry 中匹配，仅在唯一匹配时返回结果
+      3. 零匹配或多匹配均返回 None，由上层收集校验错误
+
+    Returns:
+        BasePlugin 实例或 None
+    """
     explicit = node_cfg.get("plugin")
     if explicit:
         logger.info("Matching plugin by explicit name: '%s' for node '%s'", explicit, node_cfg["id"])
@@ -170,6 +193,7 @@ def _match_plugin(node_cfg: dict):
     logger.info("Matching plugin by node_type: '%s' for node '%s'", node_type, node_cfg["id"])
     candidates = registry.find_by_node_type(node_type)
     logger.info("Plugin match by node_type: %d candidate(s) — %s", len(candidates), [p.name for p in candidates])
+    # 仅在唯一匹配时返回，避免歧义
     if len(candidates) == 1:
         return candidates[0]
     return None

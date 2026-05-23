@@ -1,3 +1,14 @@
+"""Celery 异步任务模块 — 单个部署 Job 的执行、重试、失败处理与回滚触发。
+
+核心任务 execute_job_task 的完整生命周期：
+  加载 Job → 构建连接器 → plugin.deploy() → plugin.verify() →
+  成功：检查计划完成 → 失败：根据异常类型决定重试/回滚
+
+异常分类：
+  RetryableError → 自动退避重试（最多 RETRY_MAX_COUNT 次，间隔递增）
+  FatalError    → 立即失败，触发回滚，不重试
+  Exception     → 视为未知错误，触发回滚（保留手动重试可能）
+"""
 import logging
 from celery import shared_task
 from django.utils import timezone as dj_timezone
@@ -13,9 +24,19 @@ logger = logging.getLogger(__name__)
 
 @shared_task(bind=True, max_retries=0)
 def execute_job_task(self, job_id: str):
-    """Execute a single deployment job. Handles retry and failure escalation."""
+    """Celery 任务入口 — 执行单个部署 Job 的完整流程。
+
+    bind=True 提供 self 参数用于访问 Celery 任务控制（如重试），
+    但本项目使用自定义重试机制（apply_async + countdown），而非 Celery 内建 self.retry()，
+    原因是需要精细控制退避策略和状态追踪。
+
+    max_retries=0 禁止 Celery 自动重试 — 重试由本函数手动调度。
+
+    副作用：更新 Job 和 Plan 状态、创建 AuditLog、触发回滚编排。
+    """
     logger.info("Job task start: job_id=%s", job_id)
     try:
+        # select_related 预加载关联对象，避免循环中 N+1 查询
         job = DeploymentJob.objects.select_related("plan", "node", "plugin").get(id=job_id)
     except DeploymentJob.DoesNotExist:
         logger.error("Job %s not found in database", job_id)
@@ -27,7 +48,7 @@ def execute_job_task(self, job_id: str):
         logger.info("Job %s skipped: status=%s is not in runnable states", job_id, job.status)
         return
 
-    # Update plan status if first job starting
+    # 第一个 Job 启动时，将计划从 QUEUED 推进到 RUNNING
     plan = job.plan
     if plan.status == DeploymentPlan.Status.QUEUED:
         plan.status = DeploymentPlan.Status.RUNNING
@@ -42,6 +63,7 @@ def execute_job_task(self, job_id: str):
         _maybe_rollback_plan(plan)
         return
 
+    # 连接器类型由 CFG 的 _connector_type 决定，默认 ssh
     connector_type = job.parameters.get("_connector_type", "ssh")
     logger.info("Job %s: building connector type=%s target=%s", job_id, connector_type, job.parameters.get("management_ip", "?"))
     connector = _build_connector(connector_type, job.parameters)
@@ -100,6 +122,7 @@ def execute_job_task(self, job_id: str):
             job.save(update_fields=["status", "result_log", "retry_count", "finished_at"])
             _maybe_rollback_plan(plan)
         else:
+            # 退避索引从 0 开始，使用 RETRY_BACKOFF_SECONDS 数组实现递增等待（30s → 60s → 120s）
             backoff_idx = min(job.retry_count - 1, len(settings.RETRY_BACKOFF_SECONDS) - 1)
             backoff = settings.RETRY_BACKOFF_SECONDS[backoff_idx]
             job.save(update_fields=["status", "result_log", "retry_count"])
@@ -118,6 +141,10 @@ def execute_job_task(self, job_id: str):
 
 
 def _handle_failure(job, plan, error_msg):
+    """处理部署失败 — 将 Job 标记为 FAILED 并触发回滚检查。
+
+    用于 deploy() 返回 success=False 或验证失败的情况。
+    """
     logger.warning("Handling failure for job %s: %s", job.id, error_msg)
     job.status = DeploymentJob.Status.FAILED
     job.result_log = job.result_log or {}
@@ -128,6 +155,10 @@ def _handle_failure(job, plan, error_msg):
 
 
 def _fail_job(job, error_msg):
+    """直接标记 Job 失败 — 不触发回滚（用于不可恢复错误如插件缺失、连接器构造失败）。
+
+    这种情况下 plan 中其他 job 可能也受影响，但不应因单个 job 的设施问题回滚整个计划。
+    """
     logger.error("Failing job %s: %s", job.id, error_msg)
     job.status = DeploymentJob.Status.FAILED
     job.result_log = {"error": error_msg}
@@ -136,7 +167,11 @@ def _fail_job(job, error_msg):
 
 
 def _maybe_rollback_plan(plan):
-    """Check if plan should be rolled back (any job failed)."""
+    """检查计划是否需要回滚 — 任一 Job 失败时调用。
+
+    通过回滚防止部分部署导致的环境不一致：
+    已成功的节点会被逆序回滚，未执行的节点保持原样。
+    """
     if plan.status == DeploymentPlan.Status.ROLLED_BACK:
         logger.info("Plan %s already rolled back, skipping rollback check", plan.id)
         return
@@ -147,7 +182,11 @@ def _maybe_rollback_plan(plan):
 
 
 def _check_plan_complete(plan):
-    """If all jobs are SUCCESS, mark plan COMPLETED."""
+    """检查计划是否所有 Job 均已完成 — 若是，标记计划为 COMPLETED。
+
+    排除状态：SUCCESS（完成）和 ROLLED_BACK（已回滚，视为终态）。
+    其他任何状态（PENDING/QUEUED/RUNNING/RETRYING/FAILED）均说明未完成。
+    """
     pending = DeploymentJob.objects.filter(plan=plan).exclude(
         status__in=(DeploymentJob.Status.SUCCESS, DeploymentJob.Status.ROLLED_BACK)
     )
@@ -162,7 +201,12 @@ def _check_plan_complete(plan):
 
 
 def _build_connector(connector_type: str, params: dict):
-    """Build a connector instance from job parameters."""
+    """根据连接器类型和凭据信息动态构造连接器实例。
+
+    支持三种连接器：ssh（paramiko）、telnet（telnetlib）、api（requests）。
+    凭据优先使用 admin_creds，其次 credentials，为空则返回 None。
+    management_ip 为空时无法构造连接器，返回 None。
+    """
     creds = params.get("admin_creds", params.get("credentials", {}))
     target = params.get("management_ip", "")
     if not target:
