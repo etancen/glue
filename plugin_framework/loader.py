@@ -1,12 +1,15 @@
 import json
 import importlib.util
+import logging
 import os
+import re
 import sys
-from pathlib import Path
 from typing import Optional
 from django.conf import settings
 from .base import BasePlugin
 from .registry import registry
+
+logger = logging.getLogger(__name__)
 
 
 def load_plugin_from_dir(plugin_dir: str) -> Optional[BasePlugin]:
@@ -16,19 +19,33 @@ def load_plugin_from_dir(plugin_dir: str) -> Optional[BasePlugin]:
     if not os.path.isfile(manifest_path) or not os.path.isfile(deploy_path):
         return None
 
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read plugin manifest %s: %s", manifest_path, e)
+        return None
 
-    plugin_name = manifest["name"]
-    module_name = f"_plugin_{plugin_name}"
+    plugin_name = manifest.get("name", "")
+    if not plugin_name:
+        logger.warning("Plugin manifest %s missing 'name' key", manifest_path)
+        return None
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", plugin_name)
+    module_name = f"_plugin_{safe_name}"
 
     spec = importlib.util.spec_from_file_location(module_name, deploy_path)
     if spec is None or spec.loader is None:
         return None
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except Exception as e:
+        logger.warning("Failed to load plugin module %s: %s", deploy_path, e)
+        sys.modules.pop(module_name, None)
+        return None
 
     plugin_cls = None
     for attr_name in dir(module):
@@ -42,9 +59,15 @@ def load_plugin_from_dir(plugin_dir: str) -> Optional[BasePlugin]:
             break
 
     if plugin_cls is None:
+        logger.warning("No BasePlugin subclass found in %s", deploy_path)
         return None
 
-    instance = plugin_cls()
+    try:
+        instance = plugin_cls()
+    except Exception as e:
+        logger.warning("Failed to instantiate plugin %s: %s", plugin_name, e)
+        return None
+
     instance.name = plugin_name
     instance.version = manifest.get("version", "0.0.0")
     instance.manifest = manifest
