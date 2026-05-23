@@ -49,6 +49,7 @@ class BasePlugin(ABC):
 
     name: str = ""
     version: str = ""
+    manifest: dict[str, Any] = field(default_factory=dict)
 
     @abstractmethod
     def validate_config(self, params: dict) -> bool: ...
