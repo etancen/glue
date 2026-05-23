@@ -1,0 +1,13 @@
+{
+  "name": "server-generic",
+  "version": "1.0.0",
+  "display_name": "Generic Linux Server",
+  "description": "Deploy Ubuntu/CentOS servers via PXE + SSH",
+  "node_types": ["server", "virtual_server"],
+  "connectors": ["ssh", "ipmi"],
+  "default_config": {
+    "os": "ubuntu-22.04",
+    "partition_scheme": "lvm"
+  },
+  "required_config": ["hostname", "management_ip"]
+}
